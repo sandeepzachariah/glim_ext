@@ -28,6 +28,18 @@ elseif($ENV{ROS_VERSION} EQUAL 1)
   )
 endif()
 
+# Include path for headers
+include_directories(/usr/include)
+
+# Library path
+link_directories(/usr/lib/x86_64-linux-gnu)
+
+# Manually link GeographicLib
+target_link_libraries(gnss_global
+  ${catkin_LIBRARIES}  # or ament if you're using ROS2
+  Geographic           # This links libGeographic.so
+)
+
 target_include_directories(gnss_global PRIVATE
   include
   ${GTSAM_INCLUDE_DIRS}

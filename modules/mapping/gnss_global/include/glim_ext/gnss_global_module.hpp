@@ -13,11 +13,14 @@
 
 #ifdef GLIM_ROS2
 #include <glim/util/extension_module_ros2.hpp>
-#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <GeographicLib/UTMUPS.hpp>
 
 using ExtensionModuleBase = glim::ExtensionModuleROS2;
-using PoseWithCovarianceStamped = geometry_msgs::msg::PoseWithCovarianceStamped;
-using PoseWithCovarianceStampedConstPtr = geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr;
+using NavSatFix = sensor_msgs::msg::NavSatFix;
+using NavSatFixConstPtr = sensor_msgs::msg::NavSatFix::ConstSharedPtr;
+
+using namespace GeographicLib;
 
 template <typename Stamp>
 double to_sec(const Stamp& stamp) {
@@ -25,8 +28,7 @@ double to_sec(const Stamp& stamp) {
 }
 #else
 #include <glim/util/extension_module_ros.hpp>
-#include <geometry_msgs/PoseWithCovarianceStamped.hpp>
-
+#include <sensor_msgs/NavSatFix.h>
 using ExtensionModuleBase = glim::ExtensionModuleROS;
 #endif
 
@@ -45,11 +47,12 @@ namespace glim {
 
 using gtsam::symbol_shorthand::X;
 
-/**
- * @brief Naive implementation of GNSS constraints for the global optimization.
- * @note  This implementation is very naive and ignores the IMU-GNSS transformation and GNSS observation covariance.
- *        If you use a precise GNSS (e.g., RTK), consider asking for a closed-source extension module with better GNSS handling.
- */
+struct GNSSData {
+  double timestamp;
+  Eigen::Vector3d position;
+  Eigen::Matrix3d covariance;
+};
+
 class GNSSGlobal : public ExtensionModuleBase {
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -60,7 +63,7 @@ public:
     logger->info("gnss_global_config_path={}", config_path);
 
     glim::Config config(config_path);
-    gnss_topic = config.param<std::string>("gnss", "gnss_topic", "/pose_with_cov");
+    gnss_topic = config.param<std::string>("gnss", "gnss_topic", "/fix");
     prior_inf_scale = config.param<Eigen::Vector3d>("gnss", "prior_inf_scale", Eigen::Vector3d(1e3, 1e3, 0.0));
     min_baseline = config.param<double>("gnss", "min_baseline", 5.0);
 
@@ -82,16 +85,44 @@ public:
   }
 
   virtual std::vector<GenericTopicSubscription::Ptr> create_subscriptions() override {
-    const auto sub = std::make_shared<TopicSubscription<PoseWithCovarianceStamped>>(gnss_topic, [this](const PoseWithCovarianceStampedConstPtr msg) { gnss_callback(msg); });
+    const auto sub = std::make_shared<TopicSubscription<NavSatFix>>(gnss_topic, [this](const NavSatFixConstPtr msg) { gnss_callback(msg); });
     return {sub};
   }
 
-  void gnss_callback(const PoseWithCovarianceStampedConstPtr& gnss_msg) {
-    Eigen::Vector4d gnss_data;
-    const double stamp = to_sec(gnss_msg->header.stamp);
-    const auto& pos = gnss_msg->pose.pose.position;
-    gnss_data << stamp, pos.x, pos.y, pos.z;
-    input_gnss_queue.push_back(gnss_data);
+  Eigen::Vector3d latlon_to_utm(double lat, double lon, double alt) {
+    double northing, easting;
+    int zone;
+    bool northp;
+    UTMUPS::Forward(lat, lon, zone, northp, easting, northing);
+    return Eigen::Vector3d(easting, northing, alt);
+  }
+
+  void gnss_callback(const NavSatFixConstPtr& msg) {
+    GNSSData data;
+    //logger->info("GNSS data received: lat={}, lon={}, alt={}", msg->latitude, msg->longitude, msg->altitude);
+    data.timestamp = to_sec(msg->header.stamp);
+    data.position = latlon_to_utm(msg->latitude, msg->longitude, msg->altitude);
+    for (int i = 0; i < 3; ++i)
+      for (int j = 0; j < 3; ++j)
+        data.covariance(i, j) = msg->position_covariance[i * 3 + j];
+
+    // Apply scaling heuristic to convert covariance from geodetic to UTM frame
+    // double lat_scale = 111000.0;
+    // double lon_scale = 111000.0 * std::cos(msg->latitude * M_PI / 180.0);
+
+    // Eigen::Matrix3d S = Eigen::Matrix3d::Identity();
+    // S(0, 0) = lon_scale;
+    // S(1, 1) = lat_scale;
+    // S(2, 2) = 1.0;  // altitude assumed already in meters
+
+    // Eigen::Matrix3d cov_geo;
+    // for (int i = 0; i < 3; ++i)
+    //   for (int j = 0; j < 3; ++j)
+    //     cov_geo(i, j) = msg->position_covariance[i * 3 + j];
+
+    // data.covariance = S * cov_geo * S.transpose();
+    
+    input_gnss_queue.push_back(data);
   }
 
   void on_insert_submap(const SubMap::ConstPtr& submap) { input_submap_queue.push_back(submap); }
@@ -105,109 +136,102 @@ public:
   }
 
   void backend_task() {
-    logger->info("starting GNSS global thread");
-    std::deque<Eigen::Vector4d> utm_queue;
+    std::deque<GNSSData> gnss_queue;
     std::deque<SubMap::ConstPtr> submap_queue;
 
     while (!kill_switch) {
-      // Convert GeoPoint(lat/lon) to UTM
-      const auto gnss_data = input_gnss_queue.get_all_and_clear();
-      utm_queue.insert(utm_queue.end(), gnss_data.begin(), gnss_data.end());
+      auto new_gnss = input_gnss_queue.get_all_and_clear();
+      gnss_queue.insert(gnss_queue.end(), new_gnss.begin(), new_gnss.end());
 
-      // Add new submaps
-      const auto new_submaps = input_submap_queue.get_all_and_clear();
+      auto new_submaps = input_submap_queue.get_all_and_clear();
       if (new_submaps.empty()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         continue;
       }
       submap_queue.insert(submap_queue.end(), new_submaps.begin(), new_submaps.end());
 
-      // Remove submaps that are created earlier than the oldest GNSS data
-      while (!utm_queue.empty() && !submap_queue.empty() && submap_queue.front()->frames.front()->stamp < utm_queue.front()[0]) {
+      while (!gnss_queue.empty() && !submap_queue.empty() && submap_queue.front()->frames.front()->stamp < gnss_queue.front().timestamp) {
         submap_queue.pop_front();
       }
 
-      // Interpolate UTM coords and associate with submaps
-      while (!utm_queue.empty() && !submap_queue.empty() && submap_queue.front()->frames.front()->stamp > utm_queue.front()[0] &&
-             submap_queue.front()->frames.back()->stamp < utm_queue.back()[0]) {
+      while (!gnss_queue.empty() && !submap_queue.empty()) {
         const auto& submap = submap_queue.front();
-        const double stamp = submap->frames[submap->frames.size() / 2]->stamp;
+        double submap_stamp = submap->frames[submap->frames.size() / 2]->stamp;
 
-        const auto right = std::lower_bound(utm_queue.begin(), utm_queue.end(), stamp, [](const Eigen::Vector4d& utm, const double t) { return utm[0] < t; });
-        if (right == utm_queue.end() || (right + 1) == utm_queue.end()) {
-          logger->warn("invalid condition in GNSS global module!!");
-          break;
-        }
-        const auto left = right - 1;
-        logger->debug("submap={:.6f} utm_left={:.6f} utm_right={:.6f}", stamp, (*left)[0], (*right)[0]);
+        auto right = std::lower_bound(gnss_queue.begin(), gnss_queue.end(), submap_stamp, [](const GNSSData& d, double t) { return d.timestamp < t; });
+        if (right == gnss_queue.end() || right == gnss_queue.begin()) break;
 
-        const double tl = (*left)[0];
-        const double tr = (*right)[0];
-        const double p = (stamp - tl) / (tr - tl);
-        const Eigen::Vector4d interpolated = (1.0 - p) * (*left) + p * (*right);
+        auto left = right - 1;
+        double t1 = left->timestamp, t2 = right->timestamp;
+        double p = (submap_stamp - t1) / (t2 - t1);
+
+        Eigen::Vector3d interp_pos = (1 - p) * left->position + p * right->position;
+        Eigen::Matrix3d interp_cov = (1 - p) * left->covariance + p * right->covariance;
 
         submaps.push_back(submap);
-        submap_coords.push_back(interpolated);
+        submap_coords.push_back({submap_stamp, interp_pos, interp_cov});
 
         submap_queue.pop_front();
-        utm_queue.erase(utm_queue.begin(), left);
+        gnss_queue.erase(gnss_queue.begin(), left);
       }
 
-      // Initialize T_world_utm
-      if (!transformation_initialized && !submaps.empty() && (submaps.front()->T_world_origin.inverse() * submaps.back()->T_world_origin).translation().norm() > min_baseline) {
+      if (!transformation_initialized && !submaps.empty() &&
+          (submaps.front()->T_world_origin.inverse() * submaps.back()->T_world_origin).translation().norm() > min_baseline) {
         Eigen::Vector3d mean_est = Eigen::Vector3d::Zero();
         Eigen::Vector3d mean_gnss = Eigen::Vector3d::Zero();
-        for (int i = 0; i < submaps.size(); i++) {
+        for (int i = 0; i < submaps.size(); ++i) {
           mean_est += submaps[i]->T_world_origin.translation();
-          mean_gnss += submap_coords[i].tail<3>();
+          mean_gnss += submap_coords[i].position;
         }
         mean_est /= submaps.size();
         mean_gnss /= submaps.size();
 
         Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-        for (int i = 0; i < submaps.size(); i++) {
-          const Eigen::Vector3d centered_est = submaps[i]->T_world_origin.translation() - mean_est;
-          const Eigen::Vector3d centered_gnss = submap_coords[i].tail<3>() - mean_gnss;
-          cov += centered_gnss * centered_est.transpose();
+        for (int i = 0; i < submaps.size(); ++i) {
+          Eigen::Vector3d d_est = submaps[i]->T_world_origin.translation() - mean_est;
+          Eigen::Vector3d d_gnss = submap_coords[i].position - mean_gnss;
+          cov += d_gnss * d_est.transpose();
         }
         cov /= submaps.size();
 
-        const Eigen::JacobiSVD<Eigen::Matrix2d> svd(cov.block<2, 2>(0, 0), Eigen::ComputeFullU | Eigen::ComputeFullV);
-        const Eigen::Matrix2d U = svd.matrixU();
-        const Eigen::Matrix2d V = svd.matrixV();
-        const Eigen::Matrix2d D = svd.singularValues().asDiagonal();
+        Eigen::JacobiSVD<Eigen::Matrix2d> svd(cov.block<2, 2>(0, 0), Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Matrix2d U = svd.matrixU();
+        Eigen::Matrix2d V = svd.matrixV();
         Eigen::Matrix2d S = Eigen::Matrix2d::Identity();
-
-        const double det = U.determinant() * V.determinant();
-        if (det < 0.0) {
-          S(1, 1) = -1;
-        }
+        if ((U * V.transpose()).determinant() < 0) S(1, 1) = -1;
 
         Eigen::Isometry3d T_utm_world = Eigen::Isometry3d::Identity();
         T_utm_world.linear().block<2, 2>(0, 0) = U * S * V.transpose();
         T_utm_world.translation() = mean_gnss - T_utm_world.linear() * mean_est;
 
         T_world_utm = T_utm_world.inverse();
-
-        for (int i = 0; i < submaps.size(); i++) {
-          const Eigen::Vector3d gnss = T_world_utm * submap_coords[i].tail<3>();
-          logger->debug("submap={} gnss={}", convert_to_string(submaps[i]->T_world_origin.translation().eval()), convert_to_string(gnss));
-        }
-
-        logger->info("T_world_utm={}", convert_to_string(T_world_utm));
         transformation_initialized = true;
       }
 
-      // Add translation prior factor
-      if (transformation_initialized) {
-        const Eigen::Vector3d xyz = T_world_utm * submap_coords.back().tail<3>();
-        logger->debug("submap={} gnss={}", convert_to_string(submaps.back()->T_world_origin.translation().eval()), convert_to_string(xyz));
-
+      if (transformation_initialized && !submaps.empty()) {
         const auto& submap = submaps.back();
-        // note: should use a more accurate information matrix
-        const auto model = gtsam::noiseModel::Isotropic::Information(prior_inf_scale.asDiagonal());
-        gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model));
+        const auto& gnss_data = submap_coords.back();
+
+        Eigen::Vector3d xyz = T_world_utm * gnss_data.position;
+        Eigen::Matrix3d cov = gnss_data.covariance;
+
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(cov);
+        Eigen::Vector3d eigvals = solver.eigenvalues().cwiseMax(1e-3);
+        Eigen::Matrix3d reg_cov = solver.eigenvectors() * eigvals.asDiagonal() * solver.eigenvectors().transpose();
+        Eigen::Matrix3d info = reg_cov.inverse(); // using regularized covariance from GPS signal
+        //Eigen::Matrix3d info = prior_inf_scale.asDiagonal();  // using fixed prior information scale
+        // logger->info("integrating GNSS");
+        // std::stringstream ss;
+        // ss << info;
+        // logger->info("GNSS information matrix:\n{}", ss.str());
+
+        
+
+        auto model = gtsam::noiseModel::Gaussian::Information(info);
+        auto factor = boost::make_shared<gtsam::PoseTranslationPrior<gtsam::Pose3>>(X(submap->id), xyz, model);
+        logger->info("GNSS prior factor added");
         output_factors.push_back(factor);
+
       }
     }
   }
@@ -216,12 +240,12 @@ private:
   std::atomic_bool kill_switch;
   std::thread thread;
 
-  ConcurrentVector<Eigen::Vector4d> input_gnss_queue;
+  ConcurrentVector<GNSSData> input_gnss_queue;
   ConcurrentVector<SubMap::ConstPtr> input_submap_queue;
   ConcurrentVector<gtsam::NonlinearFactor::shared_ptr> output_factors;
 
   std::vector<SubMap::ConstPtr> submaps;
-  std::vector<Eigen::Vector4d> submap_coords;
+  std::vector<GNSSData> submap_coords;
 
   std::string gnss_topic;
   Eigen::Vector3d prior_inf_scale;
@@ -230,7 +254,6 @@ private:
   bool transformation_initialized;
   Eigen::Isometry3d T_world_utm;
 
-  // Logging
   std::shared_ptr<spdlog::logger> logger;
 };
 

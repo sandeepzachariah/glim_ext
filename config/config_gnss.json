@@ -1,6 +1,6 @@
 {
   "gnss": {
-    "gnss_topic": "/gnss",
+    "gnss_topic": "/fix",
     "min_baseline": 10.0,
     "prior_inf_scale": [
       1e3,
